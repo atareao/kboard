@@ -1,0 +1,18 @@
+[package]
+name = "kboard"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "kboard"
+path = "src/main.rs"
+
+[dependencies]
+hidapi = "2.6.4"
+
+# Para parsear YAML y manejo de errores
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"

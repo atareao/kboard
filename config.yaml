@@ -1,0 +1,13 @@
+# Ejemplo de configuracion: pares codigo -> comando a ejecutar
+# keys y wheel son mapas donde la clave es el código (entero)
+
+keys:
+  104: "notify-send 'Backup started' && echo backup"
+  105: "mpv /data/atareao.es/podcasts/recursos/entrada.mp3"
+  31: "bash -lc 'echo Abrir editor; ${EDITOR:-nano}'"
+  107: "amixer -q sset Master 5%+"
+  109: "amixer -q sset Master 5%-"
+
+wheel:
+  107: "amixer -q sset Master 5%+"
+  109: "amixer -q sset Master 5%-"
