@@ -1,56 +1,18 @@
+mod models;
+
 use hidapi::HidApi;
-use serde::Deserialize;
-use std::collections::HashMap;
-use std::fs;
 use std::process::Command;
-use std::env;
-use std::path::PathBuf;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 use tracing_subscriber;
 use std::sync::{mpsc, Arc};
 use std::thread;
 
-// Definimos los IDs del dispositivo
-const VENDOR_ID: u16 = 0x1189;
-const PRODUCT_ID: u16 = 0x8890;
+use models::{
+    Config,
+    DeviceEvent,
+    Hdi,
+};
 
-#[derive(Debug)]
-enum DeviceEvent {
-    Key(u8),
-    Wheel(u8),
-}
-
-#[derive(Debug, Deserialize)]
-struct Config {
-    keys: Option<HashMap<u8, String>>,
-    wheel: Option<HashMap<u8, String>>,
-}
-
-fn load_config<P: AsRef<std::path::Path>>(path: P) -> anyhow::Result<Config> {
-    info!("📝 Cargando configuración desde {:?}", path.as_ref());
-    let s = fs::read_to_string(path)?;
-    let cfg: Config = serde_yaml::from_str(&s)?;
-    Ok(cfg)
-}
-
-fn find_config() -> Option<String> {
-    // Prefer `config.yaml` in current directory
-    let cwd = std::path::Path::new("config.yaml");
-    if cwd.exists() {
-        return Some("config.yaml".to_string());
-    }
-
-    // Fallback to $HOME/.config/kboard/config.yaml
-    if let Some(home) = env::var_os("HOME") {
-        let mut p = PathBuf::from(home);
-        p.push(".config/kboard/config.yaml");
-        if p.exists() {
-            return Some(p.to_string_lossy().into_owned());
-        }
-    }
-
-    None
-}
 
 fn try_exec(cmd: &str) {
     // Ejecuta el comando usando la shell para permitir pipelines, redirecciones, etc.
@@ -69,53 +31,17 @@ fn main() {
 
     // Cargamos la configuración YAML. Buscamos en el directorio actual primero,
     // luego en `$HOME/.config/kboard/config.yaml`.
-    let cfg = match find_config() {
-        Some(path) => match load_config(&path) {
-            Ok(c) => c,
-            Err(e) => {
-                error!("Se encontró '{}' pero no se pudo cargar: {}. Continuando sin acciones.", path, e);
-                Config {
-                    keys: None,
-                    wheel: None,
-                }
-            }
-        },
-        None => {
-            warn!("No se encontró config.yaml en el directorio actual ni en ~/.config/kboard/. Continuando sin acciones configuradas.");
-            Config {
-                keys: None,
-                wheel: None,
-            }
-        }
-    };
-
-    let cfg = Arc::new(cfg);
-
-    let api = HidApi::new().expect("Error al inicializar HIDAPI");
+    let cfg = Arc::new(Config::load_config());
+    let hdi = Arc::new(Hdi::new().expect("Error al inicializar Hdi"));
     let (tx, rx) = mpsc::channel();
-
-    // 1. Buscamos los paths dinámicamente
-    let mut path_keys = None;
-    let mut path_wheel = None;
-
-    for device in api.device_list() {
-        if device.vendor_id() == VENDOR_ID && device.product_id() == PRODUCT_ID {
-            match device.interface_number() {
-                0 => path_keys = Some(device.path().to_owned()),
-                2 => path_wheel = Some(device.path().to_owned()),
-                _ => {}
-            }
-        }
-    }
-
-    let p_keys = path_keys.expect("No se encontró la interfaz de teclas (Int 0)");
-    let p_wheel = path_wheel.expect("No se encontró la interfaz de la rueda (Int 2)");
 
     // 2. Hilo para las TECLAS
     let tx_keys = tx.clone();
+    let hdi_keys = hdi.clone();
     thread::spawn(move || {
         let api = HidApi::new().unwrap();
-        if let Ok(dev) = api.open_path(&p_keys) {
+        let p_keys = &hdi_keys.p_keys;
+        if let Ok(dev) = api.open_path(p_keys) {
             let mut buf = [0u8; 64];
             loop {
                 if let Ok(res) = dev.read(&mut buf) {
@@ -129,9 +55,11 @@ fn main() {
 
     // 3. Hilo para la RUEDA
     let tx_wheel = tx.clone();
+    let hdi_wheel = hdi.clone();
     thread::spawn(move || {
         let api = HidApi::new().unwrap();
-        if let Ok(dev) = api.open_path(&p_wheel) {
+        let p_wheel = &hdi_wheel.p_wheel;
+        if let Ok(dev) = api.open_path(p_wheel) {
             let mut buf = [0u8; 64];
             loop {
                 if let Ok(res) = dev.read(&mut buf) {
@@ -165,5 +93,58 @@ fn main() {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::models::Config;
+    use std::fs;
+    use std::env;
+    use std::sync::{Mutex, OnceLock};
+
+    static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn test_lock<'a>() -> &'a Mutex<()> {
+        TEST_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn test_config_loads_empty_when_no_file() {
+        let _guard = test_lock().lock().unwrap();
+        // Test that Config::load_config() returns empty config when no file exists
+        let orig_dir = env::current_dir().unwrap();
+        let orig_home = env::var_os("HOME");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        env::set_current_dir(tmp.path()).unwrap();
+        unsafe { env::remove_var("HOME"); } // Ensure no HOME fallback
+        
+        let cfg = Config::load_config();
+        assert!(cfg.keys.is_none());
+        assert!(cfg.wheel.is_none());
+        
+        // Restore original state
+        env::set_current_dir(orig_dir).unwrap();
+        if let Some(home) = orig_home {
+            unsafe { env::set_var("HOME", home); }
+        }
+    }
+
+    #[test]
+    fn test_config_prefers_cwd() {
+        let _guard = test_lock().lock().unwrap();
+        let orig_dir = env::current_dir().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        env::set_current_dir(tmp.path()).unwrap();
+        
+        // Create config.yaml in current directory
+        let yaml = "keys:\n  3: \"echo test\"\nwheel:\n  1: \"echo wheel\"\n";
+        fs::write(tmp.path().join("config.yaml"), yaml).unwrap();
+        
+        let cfg = Config::load_config();
+        assert!(cfg.keys.is_some());
+        assert_eq!(cfg.keys.unwrap().get(&3).map(String::as_str), Some("echo test"));
+        
+        env::set_current_dir(orig_dir).unwrap();
     }
 }
